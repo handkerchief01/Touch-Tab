@@ -1,7 +1,22 @@
 import Cocoa
 
 class SwipeManager {
-    private static let accVelXThreshold: Float = 0.07
+    private static let sensitivityKey = "sensitivity"
+    static var sensitivity: Sensitivity = UserDefaults.standard.string(forKey: sensitivityKey).flatMap(Sensitivity.init(rawValue:)) ?? .medium {
+        didSet {
+            UserDefaults.standard.set(sensitivity.rawValue, forKey: sensitivityKey)
+        }
+    }
+    // Horizontal swipe distance (fraction of the trackpad width) to move by one app. Lower is more sensitive.
+    private static var accVelXThreshold: Float {
+        switch sensitivity {
+        case .lowest: return 0.05
+        case .low: return 0.04
+        case .medium: return 0.035
+        case .high: return 0.03
+        case .highest: return 0.025
+        }
+    }
     // TODO: figure out the real value of the delay.
     private static let appSwitcherUIDelay: Double = 0.2
 
@@ -88,25 +103,28 @@ class SwipeManager {
             return
         }
 
+        // Changing direction starts counting from scratch.
+        if (velX! < 0) != (accVelX < 0) {
+            accVelX = 0
+        }
         accVelX += velX!
-        // Not enough swiping.
-        if abs(accVelX) < accVelXThreshold {
-            return
-        }
-
-        if startTime == nil {
-            startTime = Date()
-        } else {
-            let interval = startTime!.timeIntervalSinceNow
-            if -interval < appSwitcherUIDelay {
-                // We skip subsequent events until App Switcher UI is shown.
-                clearEventState()
-                return
+        // Every accVelXThreshold of swiping is one app, so a fast swipe may move by several apps at once.
+        while abs(accVelX) >= accVelXThreshold {
+            if startTime == nil {
+                startTime = Date()
+            } else {
+                let interval = startTime!.timeIntervalSinceNow
+                if -interval < appSwitcherUIDelay {
+                    // We skip subsequent events until App Switcher UI is shown.
+                    accVelX = 0
+                    return
+                }
             }
-        }
 
-        startOrContinueGesture()
-        clearEventState()
+            startOrContinueGesture()
+            // Keep the swiping beyond the threshold for the next app instead of throwing it away.
+            accVelX -= Float(signOf: accVelX, magnitudeOf: accVelXThreshold)
+        }
     }
 
     private static func processOtherFingers() {
@@ -180,5 +198,9 @@ class SwipeManager {
             case left
             case right
         }
+    }
+
+    enum Sensitivity: String, CaseIterable {
+        case lowest, low, medium, high, highest
     }
 }

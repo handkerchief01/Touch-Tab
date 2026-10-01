@@ -61,10 +61,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             withTitle: "About \(BundleInfo.displayName())",
             action: #selector(AppDelegate.showAbout),
             keyEquivalent: "")
+        statusBarItem.menu?.addItem(createSensitivityMenuItem())
         statusBarItem.menu?.addItem(
             withTitle: "Quit",
             action: #selector(AppDelegate.quit),
             keyEquivalent: "")
+    }
+
+    private func createSensitivityMenuItem() -> NSMenuItem {
+        let sensitivityMenu = NSMenu()
+        for sensitivity in SwipeManager.Sensitivity.allCases {
+            let item = sensitivityMenu.addItem(
+                withTitle: sensitivity.rawValue.capitalized,
+                action: #selector(AppDelegate.selectSensitivity(_:)),
+                keyEquivalent: "")
+            item.representedObject = sensitivity
+            item.state = sensitivity == SwipeManager.sensitivity ? .on : .off
+        }
+        let sensitivityMenuItem = NSMenuItem(title: "Sensitivity", action: nil, keyEquivalent: "")
+        sensitivityMenuItem.submenu = sensitivityMenu
+        return sensitivityMenuItem
     }
 
     private func addAccessibilityWarning() {
@@ -89,6 +105,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func openPrivacyAccessibility() {
         let privacyAccessibilityURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
         NSWorkspace.shared.open(privacyAccessibilityURL)
+    }
+
+    @objc private func selectSensitivity(_ sender: NSMenuItem) {
+        guard let sensitivity = sender.representedObject as? SwipeManager.Sensitivity else {
+            return
+        }
+        SwipeManager.sensitivity = sensitivity
+        for item in sender.menu?.items ?? [] {
+            item.state = item === sender ? .on : .off
+        }
     }
 
     @objc private func quit() {
