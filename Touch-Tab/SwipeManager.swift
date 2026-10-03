@@ -17,15 +17,25 @@ class SwipeManager {
         case .highest: return 0.025
         }
     }
+    // Vertical swipe distance (fraction of the trackpad height) to move by one row of apps. A row is a bigger jump than an app.
+    private static var accVelYThreshold: Float {
+        return accVelXThreshold * 2
+    }
     // TODO: figure out the real value of the delay.
     private static let appSwitcherUIDelay: Double = 0.2
+    // Pause after a row change, so a quick swipe up or down moves by one row only.
+    private static let rowChangeDelay: Double = 0.25
 
     private static var eventTap: CFMachPort? = nil
     // Event state.
     private static var accVelX: Float = 0
+    private static var accVelY: Float = 0
     private static var prevTouchPositions: [String: NSPoint] = [:]
     // Gesture state. Gesture may consists of multiple events.
     private static var startTime: Date? = nil
+    private static var rowChangeTime: Date? = nil
+    // Scrolling that started during the gesture, including its momentum after the gesture.
+    private static var isSkippingScroll = false
 
     //TODO: move it somewhere else?
     private static func listener(_ eventType: EventType) {
@@ -34,6 +44,10 @@ class SwipeManager {
             AppSwitcher.cmdShiftTab()
         case .startOrContinue(.right):
             AppSwitcher.cmdTab()
+        case .startOrContinue(.up):
+            AppSwitcher.cmdUp()
+        case .startOrContinue(.down):
+            AppSwitcher.cmdDown()
         case .end:
             AppSwitcher.selectInAppSwitcher()
         }
@@ -49,7 +63,7 @@ class SwipeManager {
             tap: .cghidEventTap,
             place: .headInsertEventTap,
             options: .defaultTap,
-            eventsOfInterest: NSEvent.EventTypeMask.gesture.rawValue,
+            eventsOfInterest: NSEvent.EventTypeMask([.gesture, .scrollWheel]).rawValue,
             callback: { proxy, type, cgEvent, userInfo in
                 return SwipeManager.eventHandler(proxy: proxy, eventType: type, cgEvent: cgEvent, userInfo: userInfo)
             },
@@ -68,13 +82,26 @@ class SwipeManager {
     private static func eventHandler(proxy: CGEventTapProxy, eventType: CGEventType, cgEvent: CGEvent, userInfo: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
         if eventType.rawValue == NSEvent.EventType.gesture.rawValue, let nsEvent = NSEvent(cgEvent: cgEvent) {
             touchEventHandler(nsEvent)
+        } else if eventType == .scrollWheel, let nsEvent = NSEvent(cgEvent: cgEvent), shouldSkipScroll(nsEvent) {
+            return nil
         } else if (eventType == .tapDisabledByUserInput || eventType == .tapDisabledByTimeout) {
             debugPrint("SwipeManager tap disabled", eventType.rawValue)
             CGEvent.tapEnable(tap: eventTap!, enable: true)
         }
         return Unmanaged.passUnretained(cgEvent)
     }
-    
+
+    // Two-finger scrolling moves the selection in App Switcher, so we skip it during the gesture.
+    private static func shouldSkipScroll(_ nsEvent: NSEvent) -> Bool {
+        if startTime != nil {
+            isSkippingScroll = true
+        } else if nsEvent.phase == .began || nsEvent.phase == .mayBegin || (nsEvent.phase == [] && nsEvent.momentumPhase == []) {
+            // A new scroll or a mouse wheel isn't a leftover of the gesture.
+            isSkippingScroll = false
+        }
+        return isSkippingScroll
+    }
+
     private static func touchEventHandler(_ nsEvent: NSEvent) {
         let touches = nsEvent.allTouches()
 
@@ -92,22 +119,30 @@ class SwipeManager {
     }
 
     private static func processTwoFingers() {
-        // Two fingers scrolling in App Switcher is OK but we shouldn't accumulate gesture velocity here.
+        // We shouldn't accumulate gesture velocity of two fingers. Their scrolling is skipped by shouldSkipScroll.
         clearEventState()
     }
 
     private static func processThreeFingers(touches: Set<NSTouch>) {
-        let velX = SwipeManager.horizontalSwipeVelocity(touches: touches)
-        // We don't care about non-horizontal swipes.
-        if velX == nil {
+        // We don't care about swipes where fingers don't move together.
+        guard let swipe = swipeVelocity(touches: touches) else {
             return
         }
 
+        switch swipe {
+        case .horizontal(let velX):
+            processHorizontalSwipe(velX: velX)
+        case .vertical(let velY):
+            processVerticalSwipe(velY: velY)
+        }
+    }
+
+    private static func processHorizontalSwipe(velX: Float) {
         // Changing direction starts counting from scratch.
-        if (velX! < 0) != (accVelX < 0) {
+        if (velX < 0) != (accVelX < 0) {
             accVelX = 0
         }
-        accVelX += velX!
+        accVelX += velX
         // Every accVelXThreshold of swiping is one app, so a fast swipe may move by several apps at once.
         while abs(accVelX) >= accVelXThreshold {
             if startTime == nil {
@@ -121,10 +156,40 @@ class SwipeManager {
                 }
             }
 
-            startOrContinueGesture()
+            startOrContinueGesture(direction: accVelX < 0 ? .left : .right)
             // Keep the swiping beyond the threshold for the next app instead of throwing it away.
             accVelX -= Float(signOf: accVelX, magnitudeOf: accVelXThreshold)
+            // A horizontal swipe drifting up or down shouldn't add up to a row change.
+            accVelY = 0
         }
+    }
+
+    private static func processVerticalSwipe(velY: Float) {
+        // Rows can be changed only when App Switcher UI is shown. Otherwise it's a Mission Control or App Exposé swipe.
+        if startTime == nil || -startTime!.timeIntervalSinceNow < appSwitcherUIDelay {
+            return
+        }
+        if rowChangeTime != nil && -rowChangeTime!.timeIntervalSinceNow < rowChangeDelay {
+            // We skip the rest of a quick swipe that has already changed the row.
+            accVelY = 0
+            return
+        }
+
+        // Changing direction starts counting from scratch.
+        if (velY < 0) != (accVelY < 0) {
+            accVelY = 0
+        }
+        accVelY += velY
+        // Not enough swiping.
+        if abs(accVelY) < accVelYThreshold {
+            return
+        }
+
+        // Trackpad Y grows upwards.
+        startOrContinueGesture(direction: accVelY < 0 ? .down : .up)
+        rowChangeTime = Date()
+        accVelX = 0
+        accVelY = 0
     }
 
     private static func processOtherFingers() {
@@ -137,11 +202,11 @@ class SwipeManager {
 
     private static func clearEventState() {
         accVelX = 0
+        accVelY = 0
         prevTouchPositions.removeAll()
     }
 
-    private static func startOrContinueGesture() {
-        let direction: EventType.Direction = accVelX < 0 ? .left : .right
+    private static func startOrContinueGesture(direction: EventType.Direction) {
         listener(.startOrContinue(direction: direction))
     }
 
@@ -149,15 +214,19 @@ class SwipeManager {
         listener(.end)
     }
 
-    private static func horizontalSwipeVelocity(touches: Set<NSTouch>) -> Float? {
+    private static func swipeVelocity(touches: Set<NSTouch>) -> Swipe? {
         var allRight = true
         var allLeft = true
+        var allUp = true
+        var allDown = true
         var sumVelX = Float(0)
         var sumVelY = Float(0)
         for touch in touches {
             let (velX, velY) = touchVelocity(touch)
             allRight = allRight && velX >= 0
             allLeft = allLeft && velX <= 0
+            allUp = allUp && velY >= 0
+            allDown = allDown && velY <= 0
             sumVelX += velX
             sumVelY += velY
 
@@ -167,19 +236,16 @@ class SwipeManager {
                 prevTouchPositions["\(touch.identity)"] = touch.normalizedPosition
             }
         }
-        // All fingers should move in the same direction.
-        if !allRight && !allLeft {
-            return nil
-        }
 
         let velX = sumVelX / Float(touches.count)
         let velY = sumVelY / Float(touches.count)
-        // Only horizontal swipes are interesting.
-        if abs(velX) <= abs(velY) {
-            return nil
+        // A swipe goes along its main axis, and all fingers should move in the same direction.
+        if abs(velX) > abs(velY) {
+            return allRight || allLeft ? .horizontal(velX) : nil
+        } else if abs(velY) > abs(velX) {
+            return allUp || allDown ? .vertical(velY) : nil
         }
-
-        return velX
+        return nil
     }
     
     private static func touchVelocity(_ touch: NSTouch) -> (Float, Float) {
@@ -197,7 +263,14 @@ class SwipeManager {
         enum Direction {
             case left
             case right
+            case up
+            case down
         }
+    }
+
+    private enum Swipe {
+        case horizontal(Float)
+        case vertical(Float)
     }
 
     enum Sensitivity: String, CaseIterable {
