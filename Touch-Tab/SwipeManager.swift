@@ -1,6 +1,8 @@
 import Cocoa
+import os.log
 
 class SwipeManager {
+    private static let log = OSLog(subsystem: Bundle.main.bundleIdentifier ?? "Touch-Tab", category: "SwipeManager")
     private static let sensitivityKey = "sensitivity"
     static var sensitivity: Sensitivity = UserDefaults.standard.string(forKey: sensitivityKey).flatMap(Sensitivity.init(rawValue:)) ?? .medium {
         didSet {
@@ -25,8 +27,21 @@ class SwipeManager {
     private static let appSwitcherUIDelay: Double = 0.2
     // Pause after a row change, so a quick swipe up or down moves by one row only.
     private static let rowChangeDelay: Double = 0.25
+    // Pause after waking up or unlocking before recreating the event tap, so the system is done setting up the trackpad.
+    private static let restartDelay: Double = 1
+    // How often we check the event tap, because macOS may disable it without calling us back.
+    private static let watchdogInterval: Double = 5
+    // Gesture events without touches in a row that are worth logging.
+    private static let emptyTouchEventsToLog = 100
 
     private static var eventTap: CFMachPort? = nil
+    private static var runLoopSource: CFRunLoopSource? = nil
+    private static var restartTimer: Timer? = nil
+    private static var watchdog: Timer? = nil
+    // Diagnostics, so the logs tell whether a new event tap works.
+    private static var isWaitingForTouches = false
+    private static var isWaitingForSwitch = false
+    private static var emptyTouchEvents = 0
     // Event state.
     private static var accVelX: Float = 0
     private static var accVelY: Float = 0
@@ -54,11 +69,31 @@ class SwipeManager {
     }
 
     static func start() {
-        if eventTap != nil {
-            debugPrint("SwipeManager is already started")
+        if watchdog != nil {
+            os_log("SwipeManager is already started", log: log)
             return
         }
-        debugPrint("SwipeManager start")
+        os_log("SwipeManager start", log: log)
+        createEventTap()
+
+        // After sleep the event tap may stop getting events until it's created again, like when the app is relaunched.
+        let workspaceNotifications = [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification]
+        for name in workspaceNotifications {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { notification in
+                scheduleRestart(reason: notification.name.rawValue)
+            }
+        }
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { notification in
+            scheduleRestart(reason: notification.name.rawValue)
+        }
+
+        watchdog = Timer.scheduledTimer(withTimeInterval: watchdogInterval, repeats: true) { _ in
+            checkEventTap()
+        }
+        watchdog?.tolerance = 1
+    }
+
+    private static func createEventTap() {
         eventTap = CGEvent.tapCreate(
             tap: .cghidEventTap,
             place: .headInsertEventTap,
@@ -69,24 +104,80 @@ class SwipeManager {
             },
             userInfo: nil
         )
-        if eventTap == nil {
-            debugPrint("SwipeManager couldn't create event tap")
+        guard let eventTap = eventTap else {
+            os_log("SwipeManager couldn't create event tap", log: log, type: .error)
             return
         }
-        
-        let runLoopSource = CFMachPortCreateRunLoopSource(nil, eventTap, 0)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, CFRunLoopMode.commonModes)
-        CGEvent.tapEnable(tap: eventTap!, enable: true)
+
+        let source = CFMachPortCreateRunLoopSource(nil, eventTap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, CFRunLoopMode.commonModes)
+        runLoopSource = source
+        CGEvent.tapEnable(tap: eventTap, enable: true)
+        isWaitingForTouches = true
+        isWaitingForSwitch = true
+        os_log("SwipeManager created event tap", log: log)
     }
-    
+
+    private static func destroyEventTap() {
+        // Don't leave App Switcher open if the tap goes away in the middle of a gesture.
+        if startTime != nil {
+            endGesture()
+            startTime = nil
+        }
+        clearEventState()
+        rowChangeTime = nil
+        isSkippingScroll = false
+        emptyTouchEvents = 0
+
+        if let runLoopSource = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, CFRunLoopMode.commonModes)
+        }
+        if let eventTap = eventTap {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
+            CFMachPortInvalidate(eventTap)
+        }
+        eventTap = nil
+        runLoopSource = nil
+    }
+
+    // Waking up sends several notifications in a row, so we recreate the event tap once they stop coming.
+    private static func scheduleRestart(reason: String) {
+        restartTimer?.invalidate()
+        restartTimer = Timer.scheduledTimer(withTimeInterval: restartDelay, repeats: false) { _ in
+            restartTimer = nil
+            restart(reason: reason)
+        }
+    }
+
+    private static func restart(reason: String) {
+        os_log("SwipeManager recreates event tap (%{public}@), the old one was %{public}@", log: log, reason, isEventTapEnabled() ? "enabled" : "disabled or missing")
+        destroyEventTap()
+        createEventTap()
+    }
+
+    private static func isEventTapEnabled() -> Bool {
+        guard let eventTap = eventTap else {
+            return false
+        }
+        return CFMachPortIsValid(eventTap) && CGEvent.tapIsEnabled(tap: eventTap)
+    }
+
+    private static func checkEventTap() {
+        // Without Accessibility permission a new event tap wouldn't work either.
+        if isEventTapEnabled() || !AXIsProcessTrusted() {
+            return
+        }
+        restart(reason: "watchdog")
+    }
+
     private static func eventHandler(proxy: CGEventTapProxy, eventType: CGEventType, cgEvent: CGEvent, userInfo: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
         if eventType.rawValue == NSEvent.EventType.gesture.rawValue, let nsEvent = NSEvent(cgEvent: cgEvent) {
             touchEventHandler(nsEvent)
         } else if eventType == .scrollWheel, let nsEvent = NSEvent(cgEvent: cgEvent), shouldSkipScroll(nsEvent) {
             return nil
-        } else if (eventType == .tapDisabledByUserInput || eventType == .tapDisabledByTimeout) {
-            debugPrint("SwipeManager tap disabled", eventType.rawValue)
-            CGEvent.tapEnable(tap: eventTap!, enable: true)
+        } else if (eventType == .tapDisabledByUserInput || eventType == .tapDisabledByTimeout), let eventTap = eventTap {
+            os_log("SwipeManager event tap disabled by %{public}@, enabling it again", log: log, eventType == .tapDisabledByTimeout ? "timeout" : "user input")
+            CGEvent.tapEnable(tap: eventTap, enable: true)
         }
         return Unmanaged.passUnretained(cgEvent)
     }
@@ -107,7 +198,19 @@ class SwipeManager {
 
         // Sometimes there are empty touch events that we have to skip. There are no empty touch events if Mission Control or App Expose use 3-finger swipes though.
         if touches.isEmpty {
+            emptyTouchEvents += 1
+            if emptyTouchEvents == emptyTouchEventsToLog {
+                os_log("SwipeManager got %ld gesture events in a row without touches", log: log, emptyTouchEvents)
+            }
             return
+        }
+        if emptyTouchEvents >= emptyTouchEventsToLog {
+            os_log("SwipeManager got touches again after %ld gesture events without them", log: log, emptyTouchEvents)
+        }
+        emptyTouchEvents = 0
+        if isWaitingForTouches {
+            isWaitingForTouches = false
+            os_log("SwipeManager event tap receives touches", log: log)
         }
         let touchesCount = touches.allSatisfy({ $0.phase == .ended }) ? 0 : touches.count
 
@@ -207,6 +310,10 @@ class SwipeManager {
     }
 
     private static func startOrContinueGesture(direction: EventType.Direction) {
+        if isWaitingForSwitch {
+            isWaitingForSwitch = false
+            os_log("SwipeManager switched apps with the new event tap", log: log)
+        }
         listener(.startOrContinue(direction: direction))
     }
 
