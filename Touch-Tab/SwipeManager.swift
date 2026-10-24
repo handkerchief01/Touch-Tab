@@ -27,18 +27,22 @@ class SwipeManager {
     private static let appSwitcherUIDelay: Double = 0.2
     // Pause after a row change, so a quick swipe up or down moves by one row only.
     private static let rowChangeDelay: Double = 0.25
-    // Pause after waking up or unlocking before recreating the event tap, so the system is done setting up the trackpad.
-    private static let restartDelay: Double = 1
-    // How often we check the event tap, because macOS may disable it without calling us back.
+    // Pause after waking up or unlocking before checking touches, so the system is done setting up the trackpad.
+    private static let wakeCheckDelay: Double = 1
+    // How often we check the event tap and the touch devices, because macOS may break them without telling us.
     private static let watchdogInterval: Double = 5
-    // Gesture events without touches in a row that are worth logging.
-    private static let emptyTouchEventsToLog = 100
+    // Gesture events without touches in a row after waking up, while touches worked before. About a second of using the trackpad.
+    private static let emptyTouchEventsToRelaunch = 100
 
     private static var eventTap: CFMachPort? = nil
     private static var runLoopSource: CFRunLoopSource? = nil
-    private static var restartTimer: Timer? = nil
+    private static var wakeCheckTimer: Timer? = nil
     private static var watchdog: Timer? = nil
-    // Diagnostics, so the logs tell whether a new event tap works.
+    private static var touchDeviceCountAtLaunch: Int? = nil
+    private static var isRelaunching = false
+    // Touch state, to find out when AppKit stops giving us touches.
+    private static var hasReceivedTouches = false
+    // No touches yet since the event tap was created or the system woke up.
     private static var isWaitingForTouches = false
     private static var isWaitingForSwitch = false
     private static var emptyTouchEvents = 0
@@ -73,22 +77,23 @@ class SwipeManager {
             os_log("SwipeManager is already started", log: log)
             return
         }
-        os_log("SwipeManager start", log: log)
+        touchDeviceCountAtLaunch = touchDevices()?.count
+        os_log("SwipeManager start, touch devices: %{public}@", log: log, touchDevicesDescription())
         createEventTap()
 
-        // After sleep the event tap may stop getting events until it's created again, like when the app is relaunched.
+        // After some wakes AppKit stops giving us touches, so we check them after waking up and unlocking.
         let workspaceNotifications = [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification]
         for name in workspaceNotifications {
             NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { notification in
-                scheduleRestart(reason: notification.name.rawValue)
+                scheduleWakeCheck(reason: notification.name.rawValue)
             }
         }
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { notification in
-            scheduleRestart(reason: notification.name.rawValue)
+            scheduleWakeCheck(reason: notification.name.rawValue)
         }
 
         watchdog = Timer.scheduledTimer(withTimeInterval: watchdogInterval, repeats: true) { _ in
-            checkEventTap()
+            check()
         }
         watchdog?.tolerance = 1
     }
@@ -140,19 +145,29 @@ class SwipeManager {
         runLoopSource = nil
     }
 
-    // Waking up sends several notifications in a row, so we recreate the event tap once they stop coming.
-    private static func scheduleRestart(reason: String) {
-        restartTimer?.invalidate()
-        restartTimer = Timer.scheduledTimer(withTimeInterval: restartDelay, repeats: false) { _ in
-            restartTimer = nil
-            restart(reason: reason)
+    // Waking up sends several notifications in a row, so we check once they stop coming.
+    private static func scheduleWakeCheck(reason: String) {
+        isWaitingForTouches = true
+        isWaitingForSwitch = true
+        wakeCheckTimer?.invalidate()
+        wakeCheckTimer = Timer.scheduledTimer(withTimeInterval: wakeCheckDelay, repeats: false) { _ in
+            wakeCheckTimer = nil
+            os_log("SwipeManager woke up (%{public}@), touch devices: %{public}@", log: log, reason, touchDevicesDescription())
+            check()
         }
     }
 
-    private static func restart(reason: String) {
-        os_log("SwipeManager recreates event tap (%{public}@), the old one was %{public}@", log: log, reason, isEventTapEnabled() ? "enabled" : "disabled or missing")
-        destroyEventTap()
-        createEventTap()
+    private static func check() {
+        if let countAtLaunch = touchDeviceCountAtLaunch, countAtLaunch > 0, touchDevices()?.count == 0 {
+            relaunch(reason: "AppKit lost the touch devices")
+            return
+        }
+        // Without Accessibility permission a new event tap wouldn't work either.
+        if !isEventTapEnabled() && AXIsProcessTrusted() {
+            os_log("SwipeManager event tap is disabled or missing, recreating it", log: log, type: .error)
+            destroyEventTap()
+            createEventTap()
+        }
     }
 
     private static func isEventTapEnabled() -> Bool {
@@ -162,12 +177,42 @@ class SwipeManager {
         return CFMachPortIsValid(eventTap) && CGEvent.tapIsEnabled(tap: eventTap)
     }
 
-    private static func checkEventTap() {
-        // Without Accessibility permission a new event tap wouldn't work either.
-        if isEventTapEnabled() || !AXIsProcessTrusted() {
+    // AppKit keeps its own list of touch devices in every process.
+    // We think touches stop after some wakes because the trackpad goes missing from it.
+    private static func touchDevices() -> [Any]? {
+        let selector = NSSelectorFromString("touchDevices")
+        guard let touchDeviceClass = NSClassFromString("NSTouchDevice"), class_getClassMethod(touchDeviceClass, selector) != nil else {
+            return nil
+        }
+        return (touchDeviceClass as AnyObject).perform(selector)?.takeUnretainedValue() as? [Any]
+    }
+
+    private static func touchDevicesDescription() -> String {
+        guard let touchDevices = touchDevices() else {
+            return "unknown"
+        }
+        return "\(touchDevices.count) \(touchDevices)"
+    }
+
+    // When touches are broken in this process, only a new one gets them again, like when the user relaunches the app.
+    private static func relaunch(reason: String) {
+        if isRelaunching {
             return
         }
-        restart(reason: "watchdog")
+        isRelaunching = true
+        os_log("SwipeManager relaunches the app: %{public}@", log: log, type: .error, reason)
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration) { _, error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    os_log("SwipeManager couldn't relaunch the app: %{public}@", log: log, type: .error, error.localizedDescription)
+                    isRelaunching = false
+                    return
+                }
+                NSApp.terminate(nil)
+            }
+        }
     }
 
     private static func eventHandler(proxy: CGEventTapProxy, eventType: CGEventType, cgEvent: CGEvent, userInfo: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
@@ -199,18 +244,23 @@ class SwipeManager {
         // Sometimes there are empty touch events that we have to skip. There are no empty touch events if Mission Control or App Expose use 3-finger swipes though.
         if touches.isEmpty {
             emptyTouchEvents += 1
-            if emptyTouchEvents == emptyTouchEventsToLog {
-                os_log("SwipeManager got %ld gesture events in a row without touches", log: log, emptyTouchEvents)
+            if emptyTouchEvents == emptyTouchEventsToRelaunch {
+                os_log("SwipeManager got %ld gesture events in a row without touches, touch devices: %{public}@", log: log, emptyTouchEvents, touchDevicesDescription())
+                // Touches worked before waking up, so they are broken in this process.
+                if hasReceivedTouches && isWaitingForTouches {
+                    relaunch(reason: "no touches after waking up")
+                }
             }
             return
         }
-        if emptyTouchEvents >= emptyTouchEventsToLog {
+        if emptyTouchEvents >= emptyTouchEventsToRelaunch {
             os_log("SwipeManager got touches again after %ld gesture events without them", log: log, emptyTouchEvents)
         }
         emptyTouchEvents = 0
+        hasReceivedTouches = true
         if isWaitingForTouches {
             isWaitingForTouches = false
-            os_log("SwipeManager event tap receives touches", log: log)
+            os_log("SwipeManager receives touches", log: log)
         }
         let touchesCount = touches.allSatisfy({ $0.phase == .ended }) ? 0 : touches.count
 
@@ -312,7 +362,7 @@ class SwipeManager {
     private static func startOrContinueGesture(direction: EventType.Direction) {
         if isWaitingForSwitch {
             isWaitingForSwitch = false
-            os_log("SwipeManager switched apps with the new event tap", log: log)
+            os_log("SwipeManager switched apps", log: log)
         }
         listener(.startOrContinue(direction: direction))
     }
